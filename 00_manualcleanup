@@ -1,0 +1,85 @@
+# ── Manual cleanup 1: clear the landing "inbox" (dev/test only) ───────
+# Raw bronze files are our history/audit trail — do NOT routinely delete them.
+# Only clear the landing folder when you are using it as a temporary test inbox.
+CATALOG = "medallion"
+FUEL_LANDING = f"/Volumes/{CATALOG}/bronze/landing/fuel"
+
+items = dbutils.fs.ls(FUEL_LANDING)
+if not items:
+    print(f"No files to delete in {FUEL_LANDING}")
+else:
+    deleted = []
+    for item in items:
+        dbutils.fs.rm(item.path, True)
+        deleted.append(item.path)
+    print(f"Deleted {len(deleted)} item(s) from {FUEL_LANDING}:")
+    for path in deleted:
+        print(path)
+    remaining = dbutils.fs.ls(FUEL_LANDING)
+    print(f"Remaining items: {len(remaining)}")
+
+# ── Manual cleanup 2: full silver/gold rebuild (recovery / schema redesign only) ──
+# Drops derived tables so they can be rebuilt from scratch by 02_silver / 03_gold.
+# This does NOT touch bronze raw files.
+for tbl in [
+    "silver.fuel_prices", "silver.fuel_stations", "silver.traffic_volume",
+    "gold.fuel_price_trends", "gold.servo_corridor", "gold.map_layer",
+]:
+    spark.sql(f"DROP TABLE IF EXISTS medallion.{tbl}")
+    print(f"Dropped medallion.{tbl}")
+
+# ── One-time: drop deprecated gold intermediates ──────────────────────
+# The dashboard never queried these directly; 03_gold now builds them as
+# in-memory DataFrames, so they no longer need to exist as tables.
+# Run this ONCE to remove the old materialised copies.
+for tbl in ["gold.servo_fuel_map", "gold.freight_corridor_load", "gold.heavy_by_period"]:
+    spark.sql(f"DROP TABLE IF EXISTS medallion.{tbl}")
+    print(f"Dropped deprecated medallion.{tbl}")
+# ── Gold prune: drop UNNECESSARY gold tables, protect the queried ones ──
+# Allowlist model: keep every table queried directly OR read back during the
+# build; treat any other gold table as an orphan and drop it.
+# SAFE BY DEFAULT — DRY_RUN only PRINTS. Flip it to False to actually drop.
+CATALOG = "medallion"
+SCHEMA  = "gold"
+DRY_RUN = True   # ← set to False to execute the drops
+
+# Tables to KEEP. Anything NOT listed here becomes a drop candidate.
+PROTECTED = {
+    "fuel_price_trends",          # dashboard reads directly (budgeting)
+    "servo_corridor",             # dashboard reads directly (logistics map)
+    "map_layer",                  # dashboard reads directly (freight map)
+    "heavy_daytype_by_corridor",  # dashboard dataset
+    # Intermediates (servo_fuel_map / freight_corridor_load / heavy_by_period)
+    # are built in-memory in 03_gold, so they need NOT exist as tables. Add a
+    # name here ONLY if you re-materialise an intermediate the build reads back.
+}
+
+# 1) List every real (non-temp) table currently in the gold schema
+existing = {
+    t.name
+    for t in spark.catalog.listTables(f"{CATALOG}.{SCHEMA}")
+    if not t.isTemporary
+}
+
+# 2) Work out what is safe to drop
+to_drop           = sorted(existing - PROTECTED)
+kept              = sorted(existing & PROTECTED)
+missing_protected = sorted(PROTECTED - existing)
+
+print(f"Gold schema: {CATALOG}.{SCHEMA}")
+print(f"  Keeping (protected & present): {kept}")
+print(f"  Drop candidates             : {to_drop}")
+if missing_protected:
+    print(f"  NOTE protected but not found : {missing_protected}")
+
+# 3) Drop (or preview under DRY_RUN)
+for tbl in to_drop:
+    fq = f"{CATALOG}.{SCHEMA}.{tbl}"
+    if DRY_RUN:
+        print(f"[DRY RUN] would DROP {fq}")
+    else:
+        spark.sql(f"DROP TABLE IF EXISTS {fq}")
+        print(f"Dropped {fq}")
+
+if DRY_RUN:
+    print("\nDRY_RUN is ON — nothing dropped. Set DRY_RUN = False to execute.")
