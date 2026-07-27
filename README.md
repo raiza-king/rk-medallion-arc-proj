@@ -126,7 +126,6 @@ Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode
 
 <aside>
 🛡️
-
 Protected (never pruned): `fuel_price_trends`, `servo_corridor`, `map_layer`, `heavy_daytype_by_corridor`. Add a name to `PROTECTED` only if you re-materialise an intermediate the build reads back.
 
 </aside>

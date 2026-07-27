@@ -1,0 +1,58 @@
+%sql
+-- Create a Catalog (or reuse the existing dbw_medallion_fuel catalog)
+CREATE CATALOG IF NOT EXISTS medallion;
+-- Create three medallion schemas
+CREATE SCHEMA IF NOT EXISTS medallion.bronze;
+CREATE SCHEMA IF NOT EXISTS medallion.silver;
+CREATE SCHEMA IF NOT EXISTS medallion.gold;
+-- Create managed volume where raw files land (this is your "bronze container")
+CREATE VOLUME IF NOT EXISTS medallion.bronze.landing;
+
+## Create file landing zone
+CATALOG = "medallion"
+LANDING = f"/Volumes/{CATALOG}/bronze/landing"
+## Create two file paths
+## Traffic folder is created due to no open API spec yet
+#  Traffic data is manually uploaded, updated every week
+fuel_path = f"{LANDING}/fuel"
+traffic_path = f"{LANDING}/traffic"
+dbutils.fs.mkdirs(fuel_path)
+dbutils.fs.mkdirs(traffic_path)
+print(f"Created or confirmed: {fuel_path}")
+print(f"Created or confirmed: {traffic_path}")
+
+import os, requests, base64, uuid
+from datetime import datetime
+ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+os.makedirs(f"{LANDING}/fuel", exist_ok=True)
+# Keep these in a secret scope — do NOT hardcode in the notebook
+API_KEY    = dbutils.secrets.get("medallion", "nsw_fuel_key")
+API_SECRET = dbutils.secrets.get("medallion", "nsw_fuel_secret")
+
+# 1) Exchange key+secret for an access token (Basic auth)
+basic = base64.b64encode(f"{API_KEY}:{API_SECRET}".encode()).decode()
+tok = requests.get(
+    "https://api.onegov.nsw.gov.au/oauth/client_credential/accesstoken",
+    params={"grant_type": "client_credentials"},
+    headers={"Authorization": f"Basic {basic}"},
+)
+tok.raise_for_status()
+access_token = tok.json()["access_token"]
+
+# 2) Call the prices endpoint with the REQUIRED headers
+resp = requests.get(
+    "https://api.onegov.nsw.gov.au/FuelPriceCheck/v1/fuel/prices",
+    headers={
+        "Authorization": f"Bearer {access_token}",
+        "apikey": API_KEY,
+        "transactionid": str(uuid.uuid4()),
+        "requesttimestamp": datetime.utcnow().strftime("%d/%m/%Y %I:%M:%S %p"),
+        "Content-Type": "application/json; charset=utf-8",
+    },
+)
+resp.raise_for_status()
+
+# Append-only: never overwrite prior pulls (immutable raw history)
+with open(f"{LANDING}/fuel/fuel_{ts}.json", "w") as f:
+    f.write(resp.text)
+print("Fuel bronze ready:", ts)

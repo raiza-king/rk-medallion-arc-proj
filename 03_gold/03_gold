@@ -1,0 +1,153 @@
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+CATALOG = "medallion"
+fuel     = spark.table(f"{CATALOG}.silver.fuel_prices")
+stations = spark.table(f"{CATALOG}.silver.fuel_stations")
+traffic  = spark.table(f"{CATALOG}.silver.traffic_volume")
+
+# ── Dashboard table 1: fuel_price_trends (queried directly) ──────────
+# 1) Fuel cost index — avg/min/max price by fuel type over time (budgeting)
+gold_fuel_trends = (
+    fuel.groupBy(F.date_trunc("hour", "updated_at").alias("hour_ts"), "fuel_type")
+        .agg(
+            F.avg("price").alias("avg_price"),
+            F.min("price").alias("min_price"),
+            F.max("price").alias("max_price"),
+            F.countDistinct("station_code").alias("station_count"),
+        )
+)
+gold_fuel_trends.write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.gold.fuel_price_trends")
+
+# ── Intermediates: build in-memory ONLY (NOT persisted as gold tables) ─
+# The dashboard doesn't query these; the downstream gold builds consume the
+# DataFrames directly, so servo_fuel_map / freight_corridor_load /
+# heavy_by_period no longer need to exist as tables. (No .cache() here — it
+# triggers PERSIST TABLE, which serverless compute does not support; these
+# small aggregates recompute lazily when consumed, which is fine.)
+
+# servo map — one row per station, a column per fuel type
+avg_price = fuel.groupBy("station_code", "fuel_type").agg(F.round(F.avg("price"), 1).alias("avg_price"))
+price_wide = avg_price.groupBy("station_code").pivot("fuel_type").agg(F.first("avg_price"))
+servo_map_df = (
+    stations.join(price_wide, "station_code", "left")
+    .dropDuplicates(["station_code"])
+)
+
+# freight-corridor load — heavy-vehicle volume by road/suburb (period = ALL DAYS)
+corridor_load_df = (
+    traffic
+    .filter((F.col("classification_type") == "HEAVY VEHICLES") & (F.col("period") == "ALL DAYS"))
+    .groupBy("suburb", "road_name")
+    .agg(
+        F.sum("traffic_count").alias("heavy_vehicle_count"),
+        F.avg("latitude").alias("latitude"),
+        F.avg("longitude").alias("longitude"),
+    )
+)
+
+# heavy-vehicle load by PERIOD — historical avg daily volume per period bucket
+#    (ALL DAYS · WEEKDAYS · WEEKENDS · AM PEAK · PM PEAK · OFF PEAK · PUBLIC/SCHOOL HOLIDAYS)
+heavy_by_period_df = (
+    traffic
+    .filter(F.col("classification_type") == "HEAVY VEHICLES")
+    .groupBy("suburb", "road_name", "period")
+    .agg(
+        F.round(F.avg("traffic_count"), 0).alias("avg_daily_heavy"),  # historical avg across years
+        F.min("year").alias("first_year"),
+        F.max("year").alias("last_year"),
+        F.count("*").alias("years_observed"),
+        F.avg("latitude").alias("latitude"),
+        F.avg("longitude").alias("longitude"),
+    )
+)
+
+# ── Dashboard table 2: servo_corridor (uses the intermediates above) ──
+# Servo × nearest corridor — spatial nearest-neighbour JOIN (Haversine),
+# one row per servo, with a bounding-box prefilter to prune the cross join.
+servo_pts = (
+    servo_map_df
+    .withColumnRenamed("latitude", "s_lat")
+    .withColumnRenamed("longitude", "s_lon")
+    .filter(F.col("s_lat").isNotNull() & F.col("s_lon").isNotNull())
+)
+corridor_pts = (
+    corridor_load_df
+    .select(
+        F.col("suburb").alias("nearest_suburb"),
+        F.col("road_name").alias("nearest_road"),
+        F.col("heavy_vehicle_count").alias("nearest_corridor_heavy"),
+        F.col("latitude").alias("c_lat"),
+        F.col("longitude").alias("c_lon"),
+    )
+    .filter(F.col("c_lat").isNotNull() & F.col("c_lon").isNotNull())
+)
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    dlat, dlon = F.radians(lat2 - lat1), F.radians(lon2 - lon1)
+    a = (F.sin(dlat / 2) ** 2
+         + F.cos(F.radians(lat1)) * F.cos(F.radians(lat2)) * F.sin(dlon / 2) ** 2)
+    return F.lit(6371.0) * 2 * F.asin(F.sqrt(a))   # 6371 km = Earth radius
+
+BOX = 0.5  # ~55 km bounding-box prefilter to prune the cross join
+nearest = Window.partitionBy("station_code").orderBy("dist_km")
+
+gold_servo_corridor = (
+    servo_pts.crossJoin(corridor_pts)
+    .filter((F.abs(F.col("s_lat") - F.col("c_lat")) < BOX)
+            & (F.abs(F.col("s_lon") - F.col("c_lon")) < BOX))
+    .withColumn("dist_km", F.round(haversine_km(F.col("s_lat"), F.col("s_lon"), F.col("c_lat"), F.col("c_lon")), 2))
+    .withColumn("rnk", F.row_number().over(nearest))
+    .filter(F.col("rnk") == 1)               # keep only the closest corridor per servo
+    .drop("rnk", "c_lat", "c_lon")
+    .withColumnRenamed("s_lat", "latitude")
+    .withColumnRenamed("s_lon", "longitude")
+)
+gold_servo_corridor.write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.gold.servo_corridor")
+# 6) Map layer — UNION: stack servos AND corridors as SEPARATE points on one map
+#    (each row is ONE point, tagged by `layer`)
+# Reuses the in-memory intermediates built in the previous cell
+# (servo_map_df, heavy_by_period_df) — no gold intermediate tables needed.
+import pyspark.sql.functions as F
+CATALOG = "medallion"
+fuel = spark.table(f"{CATALOG}.silver.fuel_prices")
+
+fuel_avg = (
+    fuel.groupBy("station_code")
+    .agg(F.round(F.avg("price"), 1).alias("metric"))   # servo metric = avg price across fuels
+)
+
+servo_layer = (
+    servo_map_df
+    .join(fuel_avg, "station_code", "left")
+    .select(
+        F.lit("servo").alias("layer"),
+        F.col("station_code").alias("point_id"),
+        F.col("station").alias("label"),
+        F.col("brand").alias("category"),                    # colour dimension
+        F.col("latitude"), F.col("longitude"),
+        F.col("metric"),                                     # avg fuel price (c/L)
+        F.lit("avg fuel price (c/L)").alias("metric_type"),
+        F.lit(None).cast("string").alias("period"),          # servos have no period
+    )
+)
+corridor_layer = (
+    heavy_by_period_df
+    .select(
+        F.lit("corridor").alias("layer"),
+        F.concat_ws("|", "road_name", "suburb").alias("point_id"),
+        F.concat_ws(" - ", "road_name", "suburb").alias("label"),
+        F.lit("HEAVY VEHICLES").alias("category"),
+        F.col("latitude"),
+        F.col("longitude"),
+        F.col("avg_daily_heavy").alias("metric"),            # heavy-vehicle count
+        F.lit("avg daily heavy vehicles").alias("metric_type"),
+        F.col("period"),
+    )
+)
+# unionByName matches on column NAME (safe); keeps duplicates = UNION ALL
+gold_map_layer = servo_layer.unionByName(corridor_layer)
+
+gold_map_layer.write.mode("overwrite").option("overwriteSchema", "true") \
+    .saveAsTable(f"{CATALOG}.gold.map_layer")

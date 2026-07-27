@@ -1,0 +1,166 @@
+CATALOG = "medallion"
+fuel_path = f"/Volumes/{CATALOG}/bronze/landing/fuel"
+traffic_path = f"/Volumes/{CATALOG}/bronze/landing/traffic"
+
+# ── Step 5: Transform bronze → silver via MERGE (idempotent) ─────────
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
+
+# fuel_raw may be a DataFrame (passed in) or a path string; default to the landing dir
+try:
+    fuel_input = fuel_raw
+except NameError:
+    fuel_input = fuel_path
+
+if isinstance(fuel_input, str):
+    fuel_dir = "/".join(fuel_input.rstrip("/").split("/")[:-1]) if fuel_input.endswith(".json") else fuel_input
+    available_files = [
+        item.path.replace("dbfs:", "")
+        for item in dbutils.fs.ls(fuel_dir)
+        if item.name.endswith(".json")
+    ]
+    # Ingest only the latest pull; MERGE makes re-runs safe (no duplicates)
+    if available_files:
+        fuel_input = sorted(available_files)[-1]
+
+fuel_df = spark.read.json(fuel_input) if isinstance(fuel_input, str) else fuel_input
+
+# --- Stations: reference data (current attributes) ---
+stations = (
+    fuel_df
+    .select(F.explode("stations").alias("s"))
+    .select(
+        F.col("s.code").alias("station_code"),          # join key
+        F.col("s.name").alias("station"),
+        F.col("s.brand").alias("brand"),
+        F.col("s.location.latitude").cast("double").alias("latitude"),
+        F.col("s.location.longitude").cast("double").alias("longitude"),
+    )
+    .dropDuplicates(["station_code"])
+)
+
+# --- Prices: append-only time-series (keep full history) ---
+prices = (
+    fuel_df
+    .select(F.explode("prices").alias("p"))
+    .select(
+        F.col("p.stationcode").alias("station_code"),   # join key
+        F.col("p.fueltype").alias("fuel_type"),
+        F.col("p.price").cast("double").alias("price"),
+        F.to_timestamp("p.lastupdated", "dd/MM/yyyy HH:mm:ss").alias("updated_at"),
+    )
+    .filter(F.col("price").isNotNull())
+    .dropDuplicates(["station_code", "fuel_type", "updated_at"])
+)
+
+# --- Ensure target Delta tables exist (first run only) ---
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {CATALOG}.silver.fuel_stations (
+        station_code STRING, station STRING, brand STRING,
+        latitude DOUBLE, longitude DOUBLE
+    ) USING DELTA
+""")
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {CATALOG}.silver.fuel_prices (
+        station_code STRING, fuel_type STRING, price DOUBLE, updated_at TIMESTAMP
+    ) USING DELTA
+""")
+
+# --- MERGE stations: upsert on station_code (targeted, no full overwrite) ---
+(
+    DeltaTable.forName(spark, f"{CATALOG}.silver.fuel_stations").alias("t")
+    .merge(stations.alias("s"), "t.station_code = s.station_code")
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
+    .execute()
+)
+
+# --- MERGE prices: insert only NEW observations (idempotent, keeps history) ---
+(
+    DeltaTable.forName(spark, f"{CATALOG}.silver.fuel_prices").alias("t")
+    .merge(
+        prices.alias("s"),
+        "t.station_code = s.station_code AND t.fuel_type = s.fuel_type AND t.updated_at = s.updated_at",
+    )
+    .whenNotMatchedInsertAll()
+    .execute()
+)
+
+# ── Step 5b: Traffic Volume Viewer CSV → silver.traffic_volume (MERGE) ──
+traffic_raw = (
+    spark.read
+    .option("header", True)
+    .option("inferSchema", False)     # keep station_id zero-padding intact
+    .option("encoding", "UTF-8")
+    .csv(traffic_path)
+)
+
+typed = (
+    traffic_raw
+    .select(
+        F.col("station_id"),                                     # keep as string!
+        F.trim(F.col("road_name")).alias("road_name"),
+        F.trim(F.col("suburb")).alias("suburb"),
+        F.trim(F.upper(F.col("cardinal_direction_name"))).alias("cardinal_direction_name"),
+        F.trim(F.upper(F.col("classification_type"))).alias("classification_type"),
+        F.col("year").cast("int").alias("year"),
+        F.trim(F.upper(F.col("period"))).alias("period"),
+        F.col("traffic_count").cast("long").alias("traffic_count"),
+        F.col("wgs84_latitude").cast("double").alias("latitude"),
+        F.col("wgs84_longitude").cast("double").alias("longitude"),
+        # the_geom dropped (redundant WKB hex)
+    )
+    # fill missing descriptive fields rather than dropping valid counts
+    .withColumn("road_name", F.coalesce(F.col("road_name"), F.lit("UNKNOWN")))
+    .withColumn("suburb",    F.coalesce(F.col("suburb"),    F.lit("UNKNOWN")))
+    # normalized direction for consistent grouping/display
+    .withColumn(
+        "direction",
+        F.when(F.col("cardinal_direction_name").isin(
+                   "NORTHBOUND AND SOUTHBOUND", "EASTBOUND AND WESTBOUND", "BOTH"), "BOTH")
+         .when(F.col("cardinal_direction_name") == "NORTH", "N")
+         .when(F.col("cardinal_direction_name") == "SOUTH", "S")
+         .when(F.col("cardinal_direction_name") == "EAST",  "E")
+         .when(F.col("cardinal_direction_name") == "WEST",  "W")
+         .otherwise(F.col("cardinal_direction_name")),
+    )
+    # defensive quality guards
+    .filter(F.col("traffic_count").isNotNull() & (F.col("traffic_count") > 0))
+    .filter(F.col("year").isNotNull())
+    .filter(F.col("latitude").isNotNull() & F.col("longitude").isNotNull())
+)
+
+# --- Resolve CONFLICTING duplicates on the natural grain ---
+grain = ["station_id", "cardinal_direction_name", "classification_type", "year", "period"]
+
+traffic_silver = (
+    typed.groupBy(*grain)
+    .agg(
+        F.max("traffic_count").alias("traffic_count"),          # rule: MAX wins (revisions trend up)
+        (F.countDistinct("traffic_count") > 1).alias("had_conflict"),
+        F.first("road_name", ignorenulls=True).alias("road_name"),
+        F.first("suburb",    ignorenulls=True).alias("suburb"),
+        F.first("direction", ignorenulls=True).alias("direction"),
+        F.first("latitude",  ignorenulls=True).alias("latitude"),
+        F.first("longitude", ignorenulls=True).alias("longitude"),
+    )
+)
+
+# --- Ensure partitioned target exists, then MERGE on the natural grain ---
+spark.sql(f"""
+    CREATE TABLE IF NOT EXISTS {CATALOG}.silver.traffic_volume (
+        station_id STRING, cardinal_direction_name STRING, classification_type STRING,
+        year INT, period STRING, traffic_count LONG, had_conflict BOOLEAN,
+        road_name STRING, suburb STRING, direction STRING,
+        latitude DOUBLE, longitude DOUBLE
+    ) USING DELTA PARTITIONED BY (year)
+""")
+
+merge_cond = " AND ".join([f"t.{c} = s.{c}" for c in grain])
+(
+    DeltaTable.forName(spark, f"{CATALOG}.silver.traffic_volume").alias("t")
+    .merge(traffic_silver.alias("s"), merge_cond)
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
+    .execute()
+)
