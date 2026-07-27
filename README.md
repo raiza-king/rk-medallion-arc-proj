@@ -70,9 +70,7 @@ The pipeline is built so that **re-running any layer is safe and produces the sa
 - **Full reset is quarantined.** "Drop everything and rerun" lives under `00_manualcleanup` and is reserved for schema redesign, corrupted state, or controlled backfills.
 
 <aside>
-♻️
-
-Rule of thumb: rebuild only the layer whose logic changed. Bronze accumulates, silver merges, gold overwrites.
+♻️Rule of thumb: rebuild only the layer whose logic changed. Bronze accumulates, silver merges, gold overwrites.
 
 </aside>
 
@@ -89,8 +87,6 @@ The dashboard reads three gold tables directly. The heavy intermediates are buil
 | `servo_map_df` / `corridor_load_df` / `heavy_by_period_df` | ⚙️ In-memory | Intermediates computed at runtime; **not** persisted as tables |
 
 <aside>
-🧮
-
 **`period` is a filter, never a sum.** Traffic buckets (`ALL DAYS`, `WEEKDAYS`, `WEEKENDS`, peaks, holidays) overlap — slice by one period at a time; adding them double-counts. Likewise, never sum across `classification_type` (`ALL VEHICLES` overlaps light + heavy).
 
 </aside>
@@ -111,9 +107,7 @@ The dashboard reads three gold tables directly. The heavy intermediates are buil
 4. Point a serverless SQL warehouse / dashboard at the gold tables.
 
 <aside>
-🔑
-
-Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
+🔑Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
 
 </aside>
 
@@ -125,8 +119,7 @@ Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode
 - **Gold prune (allowlist + dry-run)** — lists a `PROTECTED` keep-set of dashboard tables and drops any other gold table. Defaults to `DRY_RUN = True` so you preview before deleting.
 
 <aside>
-🛡️
-Protected (never pruned): `fuel_price_trends`, `servo_corridor`, `map_layer`, `heavy_daytype_by_corridor`. Add a name to `PROTECTED` only if you re-materialise an intermediate the build reads back.
+🛡️Protected (never pruned): `fuel_price_trends`, `servo_corridor`, `map_layer`, `heavy_daytype_by_corridor`. Add a name to `PROTECTED` only if you re-materialise an intermediate the build reads back.
 
 </aside>
 
