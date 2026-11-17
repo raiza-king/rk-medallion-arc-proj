@@ -1,6 +1,5 @@
-<aside>
 
-    ⛽ **NSW Fuel Price Project** turns two free NSW open-data feeds — live fuel prices and yearly road-traffic volumes — into a decision-support dashboard for **fuel-cost budgeting** and **freight-corridor planning**. Built on **Databricks Serverless + Unity Catalog** using an idempotent **medallion** (bronze → silver → gold) pipeline.
+⛽ **NSW Fuel Price Project** turns two free NSW open-data feeds — live fuel prices and yearly road-traffic volumes — into a decision-support dashboard for **fuel-cost budgeting** and **freight-corridor planning**. Built on **Databricks Serverless + Unity Catalog** using an idempotent **medallion** (bronze → silver → gold) pipeline.
 
 </aside>
 
