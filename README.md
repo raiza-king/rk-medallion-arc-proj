@@ -22,7 +22,7 @@ Fuel is the single biggest *variable* cost in logistics, and the roads goods tra
 | **TfNSW Traffic Volume Viewer** | Annual vehicle counts by class, direction & period (~1,900 stations since 2006) | Yearly / strategic | Bulk CSV, manually uploaded |
 
 <aside>
-🧭
+
 
 The mismatched horizons (live vs. yearly) are a feature, not a bug — they get paired at the gold / dashboard layer.
 
@@ -68,7 +68,7 @@ The pipeline is built so that **re-running any layer is safe and produces the sa
 - **Full reset is quarantined.** "Drop everything and rerun" lives under `00_manualcleanup` and is reserved for schema redesign, corrupted state, or controlled backfills.
 
 <aside>
-♻️Rule of thumb: rebuild only the layer whose logic changed. Bronze accumulates, silver merges, gold overwrites.
+Rule of thumb: rebuild only the layer whose logic changed. Bronze accumulates, silver merges, gold overwrites.
 
 </aside>
 
@@ -105,7 +105,7 @@ The dashboard reads three gold tables directly. The heavy intermediates are buil
 4. Point a serverless SQL warehouse / dashboard at the gold tables.
 
 <aside>
-🔑 Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
+Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
 
 </aside>
 
@@ -117,7 +117,7 @@ The dashboard reads three gold tables directly. The heavy intermediates are buil
 - **Gold prune (allowlist + dry-run)** — lists a `PROTECTED` keep-set of dashboard tables and drops any other gold table. Defaults to `DRY_RUN = True` so you preview before deleting.
 
 <aside>
-🛡️Protected (never pruned): `fuel_price_trends`, `servo_corridor`, `map_layer`, `heavy_daytype_by_corridor`. Add a name to `PROTECTED` only if you re-materialise an intermediate the build reads back.
+Protected (never pruned): `fuel_price_trends`, `servo_corridor`, `map_layer`, `heavy_daytype_by_corridor`. Add a name to `PROTECTED` only if you re-materialise an intermediate the build reads back.
 
 </aside>
 
