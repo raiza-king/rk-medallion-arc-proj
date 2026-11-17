@@ -1,7 +1,5 @@
 <aside>
-⛽
-
-**NSW Fuel Price Project** turns two free NSW open-data feeds — live fuel prices and yearly road-traffic volumes — into a decision-support dashboard for **fuel-cost budgeting** and **freight-corridor planning**. Built on **Databricks Serverless + Unity Catalog** using an idempotent **medallion** (bronze → silver → gold) pipeline.
+⛽ **NSW Fuel Price Project** turns two free NSW open-data feeds — live fuel prices and yearly road-traffic volumes — into a decision-support dashboard for **fuel-cost budgeting** and **freight-corridor planning**. Built on **Databricks Serverless + Unity Catalog** using an idempotent **medallion** (bronze → silver → gold) pipeline.
 
 </aside>
 
@@ -107,7 +105,7 @@ The dashboard reads three gold tables directly. The heavy intermediates are buil
 4. Point a serverless SQL warehouse / dashboard at the gold tables.
 
 <aside>
-🔑Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
+🔑 Secrets are read with `dbutils.secrets.get("medallion", ...)` — never hardcode keys. Set the scope up once via the Databricks CLI.
 
 </aside>
 
